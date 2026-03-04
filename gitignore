@@ -1,0 +1,27 @@
+# Generated data — never commit live sensor recordings
+sensors.csv
+*.csv
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Streamlit secrets (if you ever use cloud hosting)
+.streamlit/secrets.toml
+
+# Editor and OS clutter
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Exported plots (generated at runtime)
+*.png
