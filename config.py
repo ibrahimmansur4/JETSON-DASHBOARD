@@ -8,9 +8,9 @@
 
 # ── SSH Connection ────────────────────────────────────────────
 
-SSH_HOST     = "192.168.1.113"
+SSH_HOST     = ""
 SSH_PORT     = 22
-SSH_USERNAME = "byonyks"
+SSH_USERNAME = ""
 SSH_PASSWORD = ""           # Leave blank to enter at runtime in the sidebar
 
 
