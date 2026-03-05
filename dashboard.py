@@ -4,18 +4,25 @@
 #  Reads sensor data from a remote Jetson Nano via SSH/SFTP.
 #  The Jetson is never modified — all access is read-only.
 #
-#  Run:  streamlit run dashboard.py
+#  Run:  python launcher.py        (recommended — includes mDNS)
+#  Or:   streamlit run dashboard.py
 # =============================================================
 
 import streamlit as st
 import pandas as pd
 import time
+from uuid import uuid4
 from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
 
 import config as cfg
 import alarms
 import sftp_reader
 import audio
+import shared_state
+import auth
+import sftp_browser
+from fetcher import DataFetcher
 
 
 # ── Page setup ────────────────────────────────────────────────
@@ -73,42 +80,48 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Session state defaults ────────────────────────────────────
+# ── Authentication gate ──────────────────────────────────────
 
-_DEFAULTS = {
-    "ssh_client":           None,
-    "sftp":                 None,
-    "df":                   pd.DataFrame(),
-    "connected":            False,
-    "fetch_errors":         0,
-    "file_byte_offset":     0,
-    "last_file_size":       0,
-    "last_row_count":       0,
-    # Alarm tracking
-    "alarm_pump_active":    False,
-    "alarm_stale_active":   False,
-    "pump_last_value":      None,
-    "pump_last_change_ts":  None,
-    "last_known_file_size": 0,
-    "last_file_size_ts":    None,
-    "ack_until":            0.0,
-    "last_mode":            None,
-    "alarm_log":            [],
-    # Runtime threshold list — col/lo/hi editable in sidebar; exclude stays in config.py
-    "threshold_alarms_runtime": [
-        {"col": a["col"], "lo": a.get("lo"), "hi": a.get("hi"), "active": False}
-        for a in cfg.THRESHOLD_ALARMS
-    ],
-    # Chart builder state
-    "plot_groups":          None,
-    "snd_queue":            [],
+if not auth.render_login_gate():
+    st.stop()
+
+
+# ── Session registration ─────────────────────────────────────
+
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid4())
+
+session_id = st.session_state.session_id
+
+if not shared_state.register_session(session_id):
+    st.error(f"Server at capacity (max {cfg.MAX_CONNECTIONS} connections). Please try again later.")
+    st.stop()
+
+shared_state.heartbeat(session_id)
+
+
+# ── Session state defaults (local per-tab state) ─────────────
+
+_LOCAL_DEFAULTS = {
+    "ssh_client":   None,
+    "sftp":         None,
+    # Chart builder — per-session so each user can customise their view
+    "plot_groups":  None,
+    "snd_queue":    [],
 }
 
-for k, v in _DEFAULTS.items():
+for k, v in _LOCAL_DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-ss = st.session_state   # shorthand — defined here so it is available everywhere
+ss = st.session_state
+
+# Create the fetcher coordinator for this session
+if "fetcher" not in ss:
+    ss.fetcher = DataFetcher(session_id)
+
+# Read current shared state
+_shared = shared_state.read_shared()
 
 
 # ── Sidebar ───────────────────────────────────────────────────
@@ -118,17 +131,31 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown("### SSH Connection")
-    host     = st.text_input("Jetson IP Address", value=cfg.SSH_HOST)
-    port     = st.number_input("SSH Port", value=cfg.SSH_PORT, min_value=1, max_value=65535)
-    username = st.text_input("Username", value=cfg.SSH_USERNAME)
+    host     = st.text_input("Jetson IP Address", value=_shared.get("ssh_host", cfg.SSH_HOST) or cfg.SSH_HOST)
+    port     = st.number_input("SSH Port", value=_shared.get("ssh_port", cfg.SSH_PORT), min_value=1, max_value=65535)
+    username = st.text_input("Username", value=_shared.get("ssh_username", cfg.SSH_USERNAME) or cfg.SSH_USERNAME)
     password = st.text_input("Password", type="password",
-                             value=cfg.SSH_PASSWORD if cfg.SSH_PASSWORD else "")
+                             value=_shared.get("ssh_password", cfg.SSH_PASSWORD) or "")
 
     st.markdown("### CSV File")
-    remote_path  = st.text_input("Remote CSV Path", value=cfg.REMOTE_CSV_PATH)
-    time_col_cfg = st.text_input("Timestamp Column", value=cfg.TIMESTAMP_COLUMN)
+    current_csv_path = _shared.get("remote_csv_path", cfg.REMOTE_CSV_PATH)
+    remote_path  = st.text_input("Remote CSV Path", value=current_csv_path)
+    time_col_cfg = st.text_input("Timestamp Column", value=_shared.get("timestamp_column", cfg.TIMESTAMP_COLUMN))
     max_rows     = st.number_input("Max rows in memory (0 = all)",
-                                   value=cfg.MAX_ROWS, step=500)
+                                   value=_shared.get("max_rows", cfg.MAX_ROWS), step=500)
+
+    # SFTP file browser
+    if _shared.get("connected") and ss.sftp:
+        selected_file = sftp_browser.render_browser(ss.sftp, remote_path)
+        if selected_file:
+            remote_path = selected_file
+            shared_state.update_shared(
+                remote_csv_path=selected_file,
+                file_byte_offset=0,
+                last_row_count=0,
+                last_file_size=0,
+            )
+            st.rerun()
 
     st.markdown("### Refresh")
     refresh_sec = st.slider("Interval (seconds)", 2, 60, cfg.REFRESH_SEC)
@@ -149,19 +176,26 @@ with st.sidebar:
     st.markdown("**Threshold Alarms**")
     st.caption("Excluded modes are set in config.py.")
 
-    rt = ss.threshold_alarms_runtime   # shorthand
+    # Read thresholds from shared state
+    rt = _shared.get("threshold_alarms_runtime", [
+        {"col": a["col"], "lo": a.get("lo"), "hi": a.get("hi"), "active": False}
+        for a in cfg.THRESHOLD_ALARMS
+    ])
 
+    # Load shared DataFrame for column detection
+    df_for_cols = shared_state.get_shared_dataframe()
+
+    threshold_changed = False
     for i, row in enumerate(rt):
         active = row.get("active", False)
         header = f"{row['col']}" + (" — ACTIVE" if active else "")
         with st.expander(header, expanded=active):
-            # Column selector — list of numeric columns if data loaded, else free text
-            num_cols = ss.df.select_dtypes(include="number").columns.tolist() if not ss.df.empty else []
+            num_cols = df_for_cols.select_dtypes(include="number").columns.tolist() if not df_for_cols.empty else []
             if num_cols:
                 col_idx = num_cols.index(row["col"]) if row["col"] in num_cols else 0
-                row["col"] = st.selectbox("Column", num_cols, index=col_idx, key=f"thr_col_{i}")
+                new_col = st.selectbox("Column", num_cols, index=col_idx, key=f"thr_col_{i}")
             else:
-                row["col"] = st.text_input("Column", value=row["col"], key=f"thr_col_{i}")
+                new_col = st.text_input("Column", value=row["col"], key=f"thr_col_{i}")
 
             lo_on = st.checkbox("Enable low limit",  value=row["lo"]  is not None, key=f"thr_loon_{i}")
             hi_on = st.checkbox("Enable high limit", value=row["hi"] is not None, key=f"thr_hion_{i}")
@@ -171,211 +205,270 @@ with st.sidebar:
             hi_val = st.number_input("High limit", value=float(row["hi"]) if row["hi"] is not None else 100.0,
                                      step=0.5, key=f"thr_hi_{i}", disabled=not hi_on)
 
-            row["lo"] = lo_val if lo_on else None
-            row["hi"] = hi_val if hi_on else None
+            new_lo = lo_val if lo_on else None
+            new_hi = hi_val if hi_on else None
+
+            if new_col != row["col"] or new_lo != row.get("lo") or new_hi != row.get("hi"):
+                threshold_changed = True
+            row["col"] = new_col
+            row["lo"] = new_lo
+            row["hi"] = new_hi
 
             if st.button("Remove", key=f"thr_del_{i}"):
                 rt.pop(i)
+                shared_state.update_shared(threshold_alarms_runtime=rt)
                 st.rerun()
 
     if st.button("Add threshold alarm", use_container_width=True):
-        num_cols = ss.df.select_dtypes(include="number").columns.tolist() if not ss.df.empty else []
+        num_cols = df_for_cols.select_dtypes(include="number").columns.tolist() if not df_for_cols.empty else []
         default_col = num_cols[0] if num_cols else "Temperature_Outlet"
         rt.append({"col": default_col, "lo": None, "hi": 90.0, "active": False})
+        shared_state.update_shared(threshold_alarms_runtime=rt)
         st.rerun()
 
-    ack_remaining = max(0.0, st.session_state.ack_until - time.time())
+    # Sync threshold changes to shared state
+    if threshold_changed:
+        shared_state.update_shared(threshold_alarms_runtime=rt)
+
+    ack_until = _shared.get("ack_until", 0.0)
+    ack_remaining = max(0.0, ack_until - time.time())
     if ack_remaining > 0:
         st.warning(f"Silenced — {int(ack_remaining // 60)}m {int(ack_remaining % 60)}s remaining")
 
     if st.button("Acknowledge All Alarms (5 min)", use_container_width=True):
-        st.session_state.ack_until           = time.time() + cfg.ACK_SILENCE_SEC
-        st.session_state.alarm_pump_active   = False
-        st.session_state.alarm_stale_active  = False
-        st.session_state.pump_last_change_ts = time.time()
-        st.session_state.last_file_size_ts   = time.time()
-        for row in st.session_state.threshold_alarms_runtime:
+        now = time.time()
+        shared_state.update_shared(
+            ack_until=now + cfg.ACK_SILENCE_SEC,
+            alarm_pump_active=False,
+            alarm_stale_active=False,
+            pump_last_change_ts=now,
+            last_file_size_ts=now,
+        )
+        # Reset threshold active flags
+        for row in rt:
             row["active"] = False
+        shared_state.update_shared(threshold_alarms_runtime=rt)
         audio.queue("ack")
 
     st.markdown("---")
-    if st.session_state.connected:
-        st.success("CONNECTED")
+
+    # Connection status + health indicator
+    is_connected = _shared.get("connected", False)
+    fetch_errs = _shared.get("fetch_errors", 0)
+
+    if is_connected:
+        if fetch_errs == 0:
+            st.success("CONNECTED")
+        elif fetch_errs <= 2:
+            st.warning(f"CONNECTED — {fetch_errs} fetch error(s)")
+        else:
+            st.error(f"CONNECTED — {fetch_errs} errors — reconnecting...")
     else:
         st.caption("DISCONNECTED")
-    if st.session_state.fetch_errors > 0:
-        st.warning(f"{st.session_state.fetch_errors} fetch error(s)")
+
+    # Active sessions count
+    session_count = shared_state.active_session_count()
+    st.caption(f"Active sessions: {session_count}/{cfg.MAX_CONNECTIONS}")
 
 
 # ── Connect / Disconnect ──────────────────────────────────────
 
-def _reset_state():
-    for k, v in _DEFAULTS.items():
-        st.session_state[k] = v
-
 if connect_btn:
     try:
         client = sftp_reader.connect(host, int(port), username, password or None)
-        _reset_state()
-        st.session_state.ssh_client = client
-        st.session_state.sftp       = client.open_sftp()
-        st.session_state.connected  = True
+        ss.ssh_client = client
+        ss.sftp       = client.open_sftp()
+
+        # Write connection params to shared state so all sessions see them
+        shared_state.update_shared(
+            connected=True,
+            ssh_host=host,
+            ssh_port=int(port),
+            ssh_username=username,
+            ssh_password=password or "",
+            remote_csv_path=remote_path,
+            timestamp_column=time_col_cfg,
+            max_rows=int(max_rows),
+            file_byte_offset=0,
+            last_file_size=0,
+            last_row_count=0,
+            fetch_errors=0,
+            alarm_pump_active=False,
+            alarm_stale_active=False,
+        )
+        # Claim fetcher role
+        ss.fetcher.try_become_fetcher()
         st.success(f"Connected to {host}")
     except Exception as e:
         st.error(f"Connection failed: {e}")
 
 if disconnect_btn:
-    for obj in [st.session_state.get("sftp"), st.session_state.get("ssh_client")]:
+    for obj in [ss.get("sftp"), ss.get("ssh_client")]:
         if obj:
             try: obj.close()
             except: pass
-    st.session_state.sftp       = None
-    st.session_state.ssh_client = None
-    st.session_state.connected  = False
+    ss.sftp       = None
+    ss.ssh_client = None
+    ss.fetcher.release()
+    shared_state.update_shared(connected=False, fetch_errors=0)
     st.info("Disconnected.")
 
+# Re-read shared state after potential connect/disconnect
+_shared = shared_state.read_shared()
 
-# ── Data fetch ────────────────────────────────────────────────
 
-if st.session_state.connected and st.session_state.ssh_client:
-    try:
-        sftp  = sftp_reader.open_sftp(st.session_state.ssh_client,
-                                      st.session_state.sftp)
-        st.session_state.sftp = sftp
-        fsize = sftp_reader.file_size(sftp, remote_path)
-        limit = int(max_rows) if int(max_rows) > 0 else 50_000
+# ── Data fetch (primary fetcher) or read (other sessions) ────
 
-        # First load, or file was truncated / rotated
-        if st.session_state.last_row_count == 0 \
-                or fsize < st.session_state.last_file_size:
-            df_new, offset, err = sftp_reader.fetch_initial(sftp, remote_path, limit)
-            if err:
-                st.warning(f"Read warning: {err}")
-            elif not df_new.empty:
-                st.session_state.df               = df_new
-                st.session_state.last_row_count   = len(df_new)
-                st.session_state.file_byte_offset = offset
-                st.session_state.last_file_size   = fsize
-        else:
-            # Incremental fetch — only new bytes since last read
-            df_inc, new_offset, err = sftp_reader.fetch_incremental(
-                sftp, remote_path, st.session_state.file_byte_offset
-            )
-            if err:
-                st.session_state.fetch_errors += 1
-            elif df_inc is not None and not df_inc.empty:
-                expected = st.session_state.df.columns.tolist()
-                df_inc   = df_inc[
-                    df_inc.apply(lambda r: r.notna().sum(), axis=1) == len(expected)
-                ]
-                if not df_inc.empty:
-                    df_inc.columns = expected
-                    combined = pd.concat([st.session_state.df, df_inc],
-                                         ignore_index=True)
-                    if limit > 0 and len(combined) > limit:
-                        combined = combined.iloc[-limit:]
-                    st.session_state.df = combined
-                st.session_state.file_byte_offset = new_offset
-                st.session_state.last_file_size   = fsize
-                st.session_state.last_row_count   = len(st.session_state.df)
+is_connected = _shared.get("connected", False)
+df = pd.DataFrame()
 
-    except Exception as e:
-        st.session_state.fetch_errors += 1
-        st.error(f"Fetch error: {e} — retrying next cycle")
-        try:
-            if st.session_state.sftp:
-                st.session_state.sftp.close()
-            st.session_state.sftp = None
-            new_client = sftp_reader.connect(host, int(port), username, password or None)
-            st.session_state.ssh_client = new_client
-            st.session_state.sftp       = new_client.open_sftp()
-        except:
-            pass
+if is_connected:
+    is_primary = ss.fetcher.is_primary()
+
+    # If no fetcher is alive, try to become one
+    if not is_primary and not shared_state.is_fetcher_alive():
+        # Need an SSH connection to become the fetcher
+        if ss.ssh_client is None:
+            try:
+                h = _shared.get("ssh_host", host)
+                p = _shared.get("ssh_port", int(port))
+                u = _shared.get("ssh_username", username)
+                pw = _shared.get("ssh_password", password) or None
+                client = sftp_reader.connect(h, p, u, pw)
+                ss.ssh_client = client
+                ss.sftp = client.open_sftp()
+            except Exception:
+                pass
+        if ss.ssh_client:
+            is_primary = ss.fetcher.try_become_fetcher()
+
+    if is_primary and ss.ssh_client:
+        # This session performs the SFTP fetch
+        sftp_session, df, err = ss.fetcher.tick(ss.ssh_client, ss.sftp)
+        ss.sftp = sftp_session
+
+        if err:
+            st.warning(f"Fetch: {err}")
+            # Attempt reconnect on repeated errors
+            fetch_errs = _shared.get("fetch_errors", 0)
+            if fetch_errs >= 3:
+                try:
+                    if ss.sftp:
+                        ss.sftp.close()
+                    ss.sftp = None
+                    h = _shared.get("ssh_host", host)
+                    p = _shared.get("ssh_port", int(port))
+                    u = _shared.get("ssh_username", username)
+                    pw = _shared.get("ssh_password", password) or None
+                    new_client = sftp_reader.connect(h, p, u, pw)
+                    ss.ssh_client = new_client
+                    ss.sftp = new_client.open_sftp()
+                    shared_state.update_shared(fetch_errors=0)
+                except Exception:
+                    pass
+    else:
+        # Non-primary: read shared data
+        df = shared_state.get_shared_dataframe()
+
+# Fallback: if df is still empty, try shared data
+if df.empty:
+    df = shared_state.get_shared_dataframe()
 
 
 # ── Type conversion ───────────────────────────────────────────
-# SFTP delivers all bytes as strings. Convert numeric columns here.
 
 TEXT_COLS = {"Timestamp", "LogPhase", "Current Mode",
              "Expected MCU Version", "Actual MCU Version",
              "Bubble1_Status", "Bubble2_Status"}
 
-_df = st.session_state.df.copy() if not st.session_state.df.empty else st.session_state.df
-if not _df.empty:
-    for col in _df.columns:
-        if col not in TEXT_COLS and _df[col].dtype == object:
-            _df[col] = pd.to_numeric(_df[col], errors="coerce")
-    st.session_state.df = _df
+if not df.empty:
+    for col in df.columns:
+        if col not in TEXT_COLS and df[col].dtype == object:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
 
 # ── Alarm evaluation ──────────────────────────────────────────
 
-df       = st.session_state.df
-time_col = time_col_cfg.strip() if time_col_cfg.strip() in df.columns else None
-alarm    = {}
+# Re-read shared state for latest alarm info
+_shared = shared_state.read_shared()
+time_col = time_col_cfg.strip() if (not df.empty and time_col_cfg.strip() in df.columns) else None
+alarm_events = {}
 
 if not df.empty and alarms_on:
-    _acked = alarms.is_acknowledged(ss)
-    _fsize = ss.last_file_size
+    is_primary = ss.fetcher.is_primary()
 
-    # Pump stall
-    pump_firing = alarms.eval_pump_stall(
-        df, ss, float(pump_stall_sec), cfg.PUMP_EXCLUDED_MODES
-    )
-    if pump_firing:
-        if not ss.alarm_pump_active:
-            ss.alarm_pump_active = True
-            ss.alarm_log.append(
-                f"[{datetime.now():%H:%M:%S}] PUMP STALL — ticks unchanged {pump_stall_sec}s"
-            )
-        if not _acked:
+    if is_primary:
+        # Primary fetcher evaluates alarms and writes to shared state
+        alarm_state = {
+            "alarm_pump_active":    _shared.get("alarm_pump_active", False),
+            "alarm_stale_active":   _shared.get("alarm_stale_active", False),
+            "pump_last_value":      _shared.get("pump_last_value"),
+            "pump_last_change_ts":  _shared.get("pump_last_change_ts"),
+            "last_known_file_size": _shared.get("last_known_file_size", 0),
+            "last_file_size":       _shared.get("last_file_size", 0),
+            "last_file_size_ts":    _shared.get("last_file_size_ts"),
+            "ack_until":            _shared.get("ack_until", 0.0),
+            "last_mode":            _shared.get("last_mode"),
+            "threshold_alarms_runtime": _shared.get("threshold_alarms_runtime", rt),
+        }
+
+        alarm_state, alarm_events = ss.fetcher.evaluate_alarms(
+            df, alarm_state, alarms_on, pump_stall_sec, stale_sec
+        )
+
+        # Write alarm results back to shared state
+        shared_state.update_shared(
+            alarm_pump_active=alarm_state.get("alarm_pump_active", False),
+            alarm_stale_active=alarm_state.get("alarm_stale_active", False),
+            pump_last_value=alarm_state.get("pump_last_value"),
+            pump_last_change_ts=alarm_state.get("pump_last_change_ts"),
+            last_known_file_size=alarm_state.get("last_known_file_size", 0),
+            last_file_size_ts=alarm_state.get("last_file_size_ts"),
+            last_mode=alarm_state.get("last_mode"),
+            threshold_alarms_runtime=alarm_state.get("threshold_alarms_runtime", rt),
+        )
+
+        # Send webhook for critical alarms
+        if cfg.ALARM_WEBHOOK_URL and (alarm_events.get("alarm_pump") or alarm_events.get("alarm_threshold") or alarm_events.get("alarm_stale")):
+            _send_webhook(alarm_events, df)
+
+        _shared = shared_state.read_shared()
+
+    # Queue audio for this session based on shared alarm state
+    _acked = time.time() < _shared.get("ack_until", 0.0)
+    if not _acked:
+        if _shared.get("alarm_pump_active"):
             audio.queue("alarm_pump")
-    else:
-        ss.alarm_pump_active = False
-
-    # Stale data
-    stale_firing = alarms.eval_stale_data(
-        _fsize, ss, float(stale_sec), cfg.STALE_EXCLUDED_MODES, df
-    )
-    if stale_firing:
-        if not ss.alarm_stale_active:
-            ss.alarm_stale_active = True
-            ss.alarm_log.append(
-                f"[{datetime.now():%H:%M:%S}] NO DATA — file unchanged {stale_sec}s"
-            )
-        if not _acked:
+        if _shared.get("alarm_stale_active"):
             audio.queue("alarm_stale")
-    else:
-        ss.alarm_stale_active = False
+        # Check threshold active flags
+        for rt_row in _shared.get("threshold_alarms_runtime", []):
+            if rt_row.get("active"):
+                audio.queue("alarm_threshold")
+                break
 
-    # Threshold alarms — col/lo/hi from runtime (GUI-editable),
-    # exclude set from config.py (code-only).
-    # Build a merged view: zip runtime rows with config exclude sets.
-    # If the user has added more rows than config has entries, exclude defaults to empty.
-    rt_alarms = ss.threshold_alarms_runtime
-    any_threshold = False
-    for i, rt_row in enumerate(rt_alarms):
-        cfg_exclude = cfg.THRESHOLD_ALARMS[i].get("exclude", set()) if i < len(cfg.THRESHOLD_ALARMS) else set()
-        merged = {**rt_row, "exclude": cfg_exclude}
-        tripped, msg = alarms.eval_threshold(df, merged)
-        if tripped:
-            if not rt_row.get("active"):
-                rt_row["active"] = True
-                ss.alarm_log.append(f"[{datetime.now():%H:%M:%S}] THRESHOLD — {msg}")
-            any_threshold = True
-        else:
-            rt_row["active"] = False
-
-    if any_threshold and not _acked:
-        audio.queue("alarm_threshold")
-
-    # Mode change
-    mode_changed, new_mode = alarms.eval_mode_change(df, ss)
-    if mode_changed:
-        ss.alarm_log.append(f"[{datetime.now():%H:%M:%S}] MODE -> {new_mode}")
+    if alarm_events.get("mode_changed"):
         audio.queue("mode_change")
-        alarm["mode_changed"] = True
-        alarm["new_mode"]     = new_mode
+
+
+# ── Webhook helper ───────────────────────────────────────────
+
+def _send_webhook(events, df):
+    """POST alarm notification to configured webhook URL."""
+    if not cfg.ALARM_WEBHOOK_URL:
+        return
+    try:
+        import requests
+        payload = {
+            "timestamp": datetime.now().isoformat(),
+            "host": _shared.get("ssh_host", ""),
+            "events": list(events.keys()),
+        }
+        if not df.empty and "Current Mode" in df.columns:
+            payload["mode"] = str(df.iloc[-1]["Current Mode"])
+        requests.post(cfg.ALARM_WEBHOOK_URL, json=payload, timeout=5)
+    except Exception:
+        pass
 
 
 # ── Page header ───────────────────────────────────────────────
@@ -384,11 +477,17 @@ st.markdown("# Jetson Nano — Live Sensor Dashboard")
 
 hc = st.columns([2, 2, 2, 2, 1])
 with hc[0]:
-    if ss.connected:
-        st.success("LIVE")
+    if is_connected:
+        fetch_errs = _shared.get("fetch_errors", 0)
+        if fetch_errs == 0:
+            st.success("LIVE")
+        elif fetch_errs <= 2:
+            st.warning(f"LIVE ({fetch_errs} errors)")
+        else:
+            st.error(f"RECONNECTING ({fetch_errs} errors)")
     else:
         st.caption("Offline")
-with hc[1]: st.markdown(f"**Host:** `{host}:{port}`")
+with hc[1]: st.markdown(f"**Host:** `{_shared.get('ssh_host', host)}:{_shared.get('ssh_port', port)}`")
 with hc[2]: st.markdown(f"**Rows:** `{len(df):,}`")
 with hc[3]: st.markdown(f"**Updated:** `{datetime.now():%H:%M:%S}`")
 with hc[4]: st.button("Refresh")
@@ -398,18 +497,18 @@ st.divider()
 
 # ── Alarm banners ─────────────────────────────────────────────
 
-_ack_remaining = max(0.0, ss.ack_until - time.time())
+_ack_remaining = max(0.0, _shared.get("ack_until", 0.0) - time.time())
 _ack_note = (f"  *(silenced — {int(_ack_remaining // 60)}m {int(_ack_remaining % 60)}s remaining)*"
              if _ack_remaining > 0
              else "  |  *Acknowledge in sidebar to silence for 5 min*")
 
-if ss.alarm_pump_active:
+if _shared.get("alarm_pump_active"):
     st.error(f"PUMP STALL — Pump1_Ticks unchanged for {pump_stall_sec}s{_ack_note}")
 
-if ss.alarm_stale_active:
+if _shared.get("alarm_stale_active"):
     st.error(f"NO NEW DATA — file unchanged for {stale_sec}s — check Jetson process{_ack_note}")
 
-for rt_row in ss.threshold_alarms_runtime:
+for rt_row in _shared.get("threshold_alarms_runtime", []):
     if rt_row.get("active"):
         col = rt_row["col"]
         val = "N/A"
@@ -422,15 +521,17 @@ for rt_row in ss.threshold_alarms_runtime:
         limit  = f"hi={hi}" if hi is not None else f"lo={lo}"
         st.error(f"THRESHOLD — {col} = {val}  ({limit}){_ack_note}")
 
-if alarm.get("mode_changed"):
-    st.info(f"MODE CHANGED  ->  {alarm['new_mode']}")
+if alarm_events.get("mode_changed"):
+    st.info(f"MODE CHANGED  ->  {alarm_events['mode_changed']}")
 
-if ss.alarm_log:
-    with st.expander(f"Alarm Log ({len(ss.alarm_log)} events)"):
-        for entry in reversed(ss.alarm_log[-50:]):
+# Persistent alarm log from shared state
+alarm_log = shared_state.get_alarm_log()
+if alarm_log:
+    with st.expander(f"Alarm Log ({len(alarm_log)} events)"):
+        for entry in reversed(alarm_log[-50:]):
             st.text(entry)
         if st.button("Clear Log"):
-            ss.alarm_log = []
+            shared_state.update_shared(alarm_log=[])
 
 
 # ── Live status cards ─────────────────────────────────────────
@@ -597,11 +698,19 @@ if not df.empty:
 
     st.divider()
 
+    # Raw data + export
     with st.expander("Raw Data (last 100 rows)"):
         st.dataframe(df.tail(100), use_container_width=True)
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label=f"Export all {len(df):,} rows as CSV",
+            data=csv_bytes,
+            file_name=f"jetson_export_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            mime="text/csv",
+        )
 
 else:
-    if ss.connected:
+    if is_connected:
         st.info("Waiting for data — check that the CSV path is correct.")
     else:
         st.markdown("### Connect to your Jetson Nano to begin")
@@ -612,6 +721,5 @@ else:
 
 audio.render()
 
-if ss.connected:
-    time.sleep(int(refresh_sec))
-    st.rerun()
+if is_connected:
+    st_autorefresh(interval=int(refresh_sec) * 1000, key="data_refresh")

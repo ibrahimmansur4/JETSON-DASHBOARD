@@ -25,3 +25,7 @@ Thumbs.db
 
 # Exported plots (generated at runtime)
 *.png
+.claude
+
+# Shared state directory (runtime cross-session state)
+shared_state/

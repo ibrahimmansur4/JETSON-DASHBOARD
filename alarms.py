@@ -21,10 +21,17 @@ import time
 # ------------------------------------------------------------------
 
 def _get(ss, key, default=None):
+    """Read a key from session_state (attribute) or a plain dict."""
+    if isinstance(ss, dict):
+        return ss.get(key, default)
     return getattr(ss, key, default)
 
 def _set(ss, key, value):
-    setattr(ss, key, value)
+    """Write a key to session_state (attribute) or a plain dict."""
+    if isinstance(ss, dict):
+        ss[key] = value
+    else:
+        setattr(ss, key, value)
 
 
 # ------------------------------------------------------------------

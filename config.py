@@ -135,3 +135,45 @@ THRESHOLD_ALARMS = [
 # Visual alarm banners remain visible during the silence window.
 
 ACK_SILENCE_SEC = 300   # 5 minutes
+
+
+# ── Dashboard Network & Access ──────────────────────────────
+#
+# DASHBOARD_PORT must match the port in .streamlit/config.toml.
+# MDNS_HOSTNAME is advertised as <hostname>.local on the LAN.
+# MAX_CONNECTIONS caps concurrent browser sessions to avoid overload.
+# DASHBOARD_PASSWORD_HASH stores a bcrypt hash — generate it with:
+#     python auth.py set-password
+# Leave blank to disable password protection.
+
+DASHBOARD_PORT          = 8501
+MDNS_HOSTNAME           = "p2-dashboard"        # -> p2-dashboard.local
+MAX_CONNECTIONS         = 5
+DASHBOARD_PASSWORD_HASH = "$2b$12$ulLRhmD0X1IciBfCoyjoMeMMWv/2e14CoQOXj43SmqszliEBsy3kW"                     # set via: python auth.py set-password
+STATE_DIR               = "shared_state"         # directory for shared state files
+
+
+# ── Notification Webhooks ────────────────────────────────────
+#
+# Optional URL for critical alarm notifications (Slack, Teams, Discord).
+# Leave blank to disable. When set, a JSON payload is POSTed on
+# pump stall, threshold violation, and stale-data alarms.
+
+ALARM_WEBHOOK_URL = ""
+
+
+# ── Device Profiles (future multi-Jetson support) ────────────
+#
+# Named device profiles. DEFAULT_DEVICE selects which one to use.
+# Additional devices can be added here for future multi-device support.
+
+DEVICES = {
+    "jetson-1": {
+        "host":     SSH_HOST,
+        "port":     SSH_PORT,
+        "username": SSH_USERNAME,
+        "password": SSH_PASSWORD,
+        "csv_path": REMOTE_CSV_PATH,
+    },
+}
+DEFAULT_DEVICE = "jetson-1"
